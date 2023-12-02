@@ -13,13 +13,12 @@ use core::convert::TryFrom;
 use core::fmt::Debug;
 use core::hash::{Hash, Hasher};
 
-#[cfg(feature = "digest")]
-use curve25519_dalek::digest::generic_array::typenum::U64;
-use curve25519_dalek::digest::Digest;
-use curve25519_dalek::edwards::CompressedEdwardsY;
-use curve25519_dalek::edwards::EdwardsPoint;
-use curve25519_dalek::montgomery::MontgomeryPoint;
-use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::{
+    digest::{generic_array::typenum::U64, Digest},
+    edwards::{CompressedEdwardsY, EdwardsPoint},
+    montgomery::MontgomeryPoint,
+    scalar::Scalar,
+};
 
 use ed25519::signature::Verifier;
 
@@ -36,10 +35,13 @@ use crate::context::Context;
 #[cfg(feature = "digest")]
 use signature::DigestVerifier;
 
-use crate::constants::*;
-use crate::errors::*;
-use crate::signature::*;
-use crate::signing::*;
+use crate::{
+    constants::PUBLIC_KEY_LENGTH,
+    errors::{InternalError, SignatureError},
+    hazmat::ExpandedSecretKey,
+    signature::InternalSignature,
+    signing::SigningKey,
+};
 
 /// An ed25519 public key.
 ///
@@ -63,7 +65,7 @@ pub struct VerifyingKey {
 }
 
 impl Debug for VerifyingKey {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "VerifyingKey({:?}), {:?})", self.compressed, self.point)
     }
 }
@@ -89,14 +91,22 @@ impl PartialEq<VerifyingKey> for VerifyingKey {
 impl From<&ExpandedSecretKey> for VerifyingKey {
     /// Derive this public key from its corresponding `ExpandedSecretKey`.
     fn from(expanded_secret_key: &ExpandedSecretKey) -> VerifyingKey {
-        let bits: [u8; 32] = expanded_secret_key.scalar.to_bytes();
-        VerifyingKey::clamp_and_mul_base(bits)
+        VerifyingKey::clamp_and_mul_base(expanded_secret_key.scalar_bytes)
     }
 }
 
 impl From<&SigningKey> for VerifyingKey {
     fn from(signing_key: &SigningKey) -> VerifyingKey {
         signing_key.verifying_key()
+    }
+}
+
+impl From<EdwardsPoint> for VerifyingKey {
+    fn from(point: EdwardsPoint) -> VerifyingKey {
+        VerifyingKey {
+            point,
+            compressed: point.compress(),
+        }
     }
 }
 
@@ -180,24 +190,27 @@ impl VerifyingKey {
     /// Internal utility function for clamping a scalar representation and multiplying by the
     /// basepont to produce a public key.
     fn clamp_and_mul_base(bits: [u8; 32]) -> VerifyingKey {
-        let scalar = Scalar::from_bits_clamped(bits);
-        let point = EdwardsPoint::mul_base(&scalar);
+        let point = EdwardsPoint::mul_base_clamped(bits);
         let compressed = point.compress();
 
         // Invariant: VerifyingKey.1 is always the decompression of VerifyingKey.0
         VerifyingKey { compressed, point }
     }
 
-    // A helper function that computes H(R || A || M). If `context.is_some()`, this does the
-    // prehashed variant of the computation using its contents.
+    // A helper function that computes `H(R || A || M)` where `H` is the 512-bit hash function
+    // given by `CtxDigest` (this is SHA-512 in spec-compliant Ed25519). If `context.is_some()`,
+    // this does the prehashed variant of the computation using its contents.
     #[allow(non_snake_case)]
-    fn compute_challenge(
+    fn compute_challenge<CtxDigest>(
         context: Option<&[u8]>,
         R: &CompressedEdwardsY,
         A: &CompressedEdwardsY,
         M: &[u8],
-    ) -> Scalar {
-        let mut h = Sha512::new();
+    ) -> Scalar
+    where
+        CtxDigest: Digest<OutputSize = U64>,
+    {
+        let mut h = CtxDigest::new();
         if let Some(c) = context {
             h.update(b"SigEd25519 no Ed25519 collisions");
             h.update([1]); // Ed25519ph
@@ -219,16 +232,81 @@ impl VerifyingKey {
     // See the validation criteria blog post for more details:
     //     https://hdevalence.ca/blog/2020-10-04-its-25519am
     #[allow(non_snake_case)]
-    fn recompute_r(
+    fn recompute_R<CtxDigest>(
         &self,
         context: Option<&[u8]>,
         signature: &InternalSignature,
         M: &[u8],
-    ) -> CompressedEdwardsY {
-        let k = Self::compute_challenge(context, &signature.R, &self.compressed, M);
+    ) -> CompressedEdwardsY
+    where
+        CtxDigest: Digest<OutputSize = U64>,
+    {
+        let k = Self::compute_challenge::<CtxDigest>(context, &signature.R, &self.compressed, M);
         let minus_A: EdwardsPoint = -self.point;
         // Recall the (non-batched) verification equation: -[k]A + [s]B = R
         EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &(minus_A), &signature.s).compress()
+    }
+
+    /// The ordinary non-batched Ed25519 verification check, rejecting non-canonical R values. (see
+    /// [`Self::recompute_R`]). `CtxDigest` is the digest used to calculate the pseudorandomness
+    /// needed for signing. According to the spec, `CtxDigest = Sha512`.
+    ///
+    /// This definition is loose in its parameters so that end-users of the `hazmat` module can
+    /// change how the `ExpandedSecretKey` is calculated and which hash function to use.
+    #[allow(non_snake_case)]
+    pub(crate) fn raw_verify<CtxDigest>(
+        &self,
+        message: &[u8],
+        signature: &ed25519::Signature,
+    ) -> Result<(), SignatureError>
+    where
+        CtxDigest: Digest<OutputSize = U64>,
+    {
+        let signature = InternalSignature::try_from(signature)?;
+
+        let expected_R = self.recompute_R::<CtxDigest>(None, &signature, message);
+        if expected_R == signature.R {
+            Ok(())
+        } else {
+            Err(InternalError::Verify.into())
+        }
+    }
+
+    /// The prehashed non-batched Ed25519 verification check, rejecting non-canonical R values.
+    /// (see [`Self::recompute_R`]). `CtxDigest` is the digest used to calculate the
+    /// pseudorandomness needed for signing. `MsgDigest` is the digest used to hash the signed
+    /// message. According to the spec, `MsgDigest = CtxDigest = Sha512`.
+    ///
+    /// This definition is loose in its parameters so that end-users of the `hazmat` module can
+    /// change how the `ExpandedSecretKey` is calculated and which hash function to use.
+    #[cfg(feature = "digest")]
+    #[allow(non_snake_case)]
+    pub(crate) fn raw_verify_prehashed<CtxDigest, MsgDigest>(
+        &self,
+        prehashed_message: MsgDigest,
+        context: Option<&[u8]>,
+        signature: &ed25519::Signature,
+    ) -> Result<(), SignatureError>
+    where
+        CtxDigest: Digest<OutputSize = U64>,
+        MsgDigest: Digest<OutputSize = U64>,
+    {
+        let signature = InternalSignature::try_from(signature)?;
+
+        let ctx: &[u8] = context.unwrap_or(b"");
+        debug_assert!(
+            ctx.len() <= 255,
+            "The context must not be longer than 255 octets."
+        );
+
+        let message = prehashed_message.finalize();
+        let expected_R = self.recompute_R::<CtxDigest>(Some(ctx), &signature, &message);
+
+        if expected_R == signature.R {
+            Ok(())
+        } else {
+            Err(InternalError::Verify.into())
+        }
     }
 
     /// Verify a `signature` on a `prehashed_message` using the Ed25519ph algorithm.
@@ -246,34 +324,26 @@ impl VerifyingKey {
     /// # Returns
     ///
     /// Returns `true` if the `signature` was a valid signature created by this
-    /// `Keypair` on the `prehashed_message`.
+    /// [`SigningKey`] on the `prehashed_message`.
+    ///
+    /// # Note
+    ///
+    /// The RFC only permits SHA-512 to be used for prehashing, i.e., `MsgDigest = Sha512`. This
+    /// function technically works, and is probably safe to use, with any secure hash function with
+    /// 512-bit digests, but anything outside of SHA-512 is NOT specification-compliant. We expose
+    /// [`crate::Sha512`] for user convenience.
     #[cfg(feature = "digest")]
     #[allow(non_snake_case)]
-    pub fn verify_prehashed<D>(
+    pub fn verify_prehashed<MsgDigest>(
         &self,
-        prehashed_message: D,
+        prehashed_message: MsgDigest,
         context: Option<&[u8]>,
         signature: &ed25519::Signature,
     ) -> Result<(), SignatureError>
     where
-        D: Digest<OutputSize = U64>,
+        MsgDigest: Digest<OutputSize = U64>,
     {
-        let signature = InternalSignature::try_from(signature)?;
-
-        let ctx: &[u8] = context.unwrap_or(b"");
-        debug_assert!(
-            ctx.len() <= 255,
-            "The context must not be longer than 255 octets."
-        );
-
-        let message = prehashed_message.finalize();
-        let expected_R = self.recompute_r(Some(ctx), &signature, &message);
-
-        if expected_R == signature.R {
-            Ok(())
-        } else {
-            Err(InternalError::Verify.into())
-        }
+        self.raw_verify_prehashed::<Sha512, MsgDigest>(prehashed_message, context, signature)
     }
 
     /// Strictly verify a signature on a message with this keypair's public key.
@@ -356,7 +426,7 @@ impl VerifyingKey {
             return Err(InternalError::Verify.into());
         }
 
-        let expected_R = self.recompute_r(None, &signature, message);
+        let expected_R = self.recompute_R::<Sha512>(None, &signature, message);
         if expected_R == signature.R {
             Ok(())
         } else {
@@ -380,17 +450,24 @@ impl VerifyingKey {
     /// # Returns
     ///
     /// Returns `true` if the `signature` was a valid signature created by this
-    /// `Keypair` on the `prehashed_message`.
+    /// [`SigningKey`] on the `prehashed_message`.
+    ///
+    /// # Note
+    ///
+    /// The RFC only permits SHA-512 to be used for prehashing, i.e., `MsgDigest = Sha512`. This
+    /// function technically works, and is probably safe to use, with any secure hash function with
+    /// 512-bit digests, but anything outside of SHA-512 is NOT specification-compliant. We expose
+    /// [`crate::Sha512`] for user convenience.
     #[cfg(feature = "digest")]
     #[allow(non_snake_case)]
-    pub fn verify_prehashed_strict<D>(
+    pub fn verify_prehashed_strict<MsgDigest>(
         &self,
-        prehashed_message: D,
+        prehashed_message: MsgDigest,
         context: Option<&[u8]>,
         signature: &ed25519::Signature,
     ) -> Result<(), SignatureError>
     where
-        D: Digest<OutputSize = U64>,
+        MsgDigest: Digest<OutputSize = U64>,
     {
         let signature = InternalSignature::try_from(signature)?;
 
@@ -411,7 +488,7 @@ impl VerifyingKey {
         }
 
         let message = prehashed_message.finalize();
-        let expected_R = self.recompute_r(Some(ctx), &signature, &message);
+        let expected_R = self.recompute_R::<Sha512>(Some(ctx), &signature, &message);
 
         if expected_R == signature.R {
             Ok(())
@@ -422,15 +499,19 @@ impl VerifyingKey {
 
     /// Convert this verifying key into Montgomery form.
     ///
-    /// This is useful for systems which perform X25519 Diffie-Hellman using
-    /// Ed25519 keys.
+    /// This can be used for performing X25519 Diffie-Hellman using Ed25519 keys. The output of
+    /// this function is a valid X25519 public key whose secret key is `sk.to_scalar_bytes()`,
+    /// where `sk` is a valid signing key for this `VerifyingKey`.
     ///
-    /// When possible, it's recommended to use separate keys for signing and
-    /// Diffie-Hellman.
+    /// # Note
     ///
-    /// For more information on the security of systems which use the same keys
-    /// for both signing and Diffie-Hellman, see the paper
-    /// [On using the same key pair for Ed25519 and an X25519 based KEM](https://eprint.iacr.org/2021/509.pdf).
+    /// We do NOT recommend this usage of a signing/verifying key. Signing keys are usually
+    /// long-term keys, while keys used for key exchange should rather be ephemeral. If you can
+    /// help it, use a separate key for encryption.
+    ///
+    /// For more information on the security of systems which use the same keys for both signing
+    /// and Diffie-Hellman, see the paper
+    /// [On using the same key pair for Ed25519 and an X25519 based KEM](https://eprint.iacr.org/2021/509).
     pub fn to_montgomery(&self) -> MontgomeryPoint {
         self.point.to_montgomery()
     }
@@ -442,28 +523,20 @@ impl Verifier<ed25519::Signature> for VerifyingKey {
     /// # Return
     ///
     /// Returns `Ok(())` if the signature is valid, and `Err` otherwise.
-    #[allow(non_snake_case)]
     fn verify(&self, message: &[u8], signature: &ed25519::Signature) -> Result<(), SignatureError> {
-        let signature = InternalSignature::try_from(signature)?;
-
-        let expected_R = self.recompute_r(None, &signature, message);
-        if expected_R == signature.R {
-            Ok(())
-        } else {
-            Err(InternalError::Verify.into())
-        }
+        self.raw_verify::<Sha512>(message, signature)
     }
 }
 
 /// Equivalent to [`VerifyingKey::verify_prehashed`] with `context` set to [`None`].
 #[cfg(feature = "digest")]
-impl<D> DigestVerifier<D, ed25519::Signature> for VerifyingKey
+impl<MsgDigest> DigestVerifier<MsgDigest, ed25519::Signature> for VerifyingKey
 where
-    D: Digest<OutputSize = U64>,
+    MsgDigest: Digest<OutputSize = U64>,
 {
     fn verify_digest(
         &self,
-        msg_digest: D,
+        msg_digest: MsgDigest,
         signature: &ed25519::Signature,
     ) -> Result<(), SignatureError> {
         self.verify_prehashed(msg_digest, None, signature)
@@ -473,13 +546,13 @@ where
 /// Equivalent to [`VerifyingKey::verify_prehashed`] with `context` set to [`Some`]
 /// containing `self.value()`.
 #[cfg(feature = "digest")]
-impl<D> DigestVerifier<D, ed25519::Signature> for Context<'_, '_, VerifyingKey>
+impl<MsgDigest> DigestVerifier<MsgDigest, ed25519::Signature> for Context<'_, '_, VerifyingKey>
 where
-    D: Digest<OutputSize = U64>,
+    MsgDigest: Digest<OutputSize = U64>,
 {
     fn verify_digest(
         &self,
-        msg_digest: D,
+        msg_digest: MsgDigest,
         signature: &ed25519::Signature,
     ) -> Result<(), SignatureError> {
         self.key()

@@ -1,3 +1,11 @@
+# ARCHIVED
+
+This repo has been [moved](https://github.com/dalek-cryptography/curve25519-dalek). Please direct all issues and pull requests to the new repo.
+
+This repo will remain here in a read-only state for historical purposes.
+
+---
+
 # ed25519-dalek [![](https://img.shields.io/crates/v/ed25519-dalek.svg)](https://crates.io/crates/ed25519-dalek) [![](https://docs.rs/ed25519-dalek/badge.svg)](https://docs.rs/ed25519-dalek) [![Rust](https://github.com/dalek-cryptography/ed25519-dalek/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/dalek-cryptography/ed25519-dalek/actions/workflows/rust.yml)
 
 Fast and efficient Rust implementation of ed25519 key generation, signing, and
@@ -18,7 +26,7 @@ ed25519-dalek = "1"
 To use the latest prerelease (see changes [below](#breaking-changes-in-200)),
 use the following line in your project's `Cargo.toml`:
 ```toml
-ed25519-dalek = "2.0.0-rc.2"
+ed25519-dalek = "2.0.0-rc.3"
 ```
 
 # Feature Flags
@@ -37,6 +45,7 @@ This crate is `#[no_std]` compatible with `default-features = false`.
 | `pkcs8`                |          | Enables [PKCS#8](https://en.wikipedia.org/wiki/PKCS_8) serialization/deserialization for `SigningKey` and `VerifyingKey` |
 | `pem`                  |          | Enables PEM serialization support for PKCS#8 private keys and SPKI public keys. Also enables `alloc`. |
 | `legacy_compatibility` |          | **Unsafe:** Disables certain signature checks. See [below](#malleability-and-the-legacy_compatibility-feature) |
+| `hazmat` |          | **Unsafe:** Exposes the `hazmat` module for raw signing/verifying. Misuse of these functions will expose the private key, as in the [signing oracle attack](https://github.com/MystenLabs/ed25519-unsafe-libs). |
 
 # Major Changes
 
@@ -54,6 +63,7 @@ See [CHANGELOG.md](CHANGELOG.md) for a list of changes made in past version of t
 * Make all batch verification deterministic remove `batch_deterministic` ([#256](https://github.com/dalek-cryptography/ed25519-dalek/pull/256))
 * Remove `ExpandedSecretKey` API ((#205)[https://github.com/dalek-cryptography/ed25519-dalek/pull/205])
 * Rename `Keypair` → `SigningKey` and `PublicKey` → `VerifyingKey`
+* Make `hazmat` feature to expose, `ExpandedSecretKey`, `raw_sign()`, `raw_sign_prehashed()`, `raw_verify()`, and `raw_verify_prehashed()`
 
 # Documentation
 
@@ -101,7 +111,7 @@ Benchmarks are run using [criterion.rs](https://github.com/japaric/criterion.rs)
 ```sh
 cargo bench --features "batch"
 # Uses avx2 or ifma only if compiled for an appropriate target.
-export RUSTFLAGS='--cfg curve25519_dalek_backend="simd" -C target_cpu=native'
+export RUSTFLAGS='-C target_cpu=native'
 cargo +nightly bench --features "batch"
 ```
 
@@ -132,7 +142,7 @@ want to test the benchmarks on your target CPU to discover the best size.
 
 ## (Micro)Architecture Specific Backends
 
-A _backend_ refers to an implementation of elliptic curve and scalar arithmetic. Different backends have different use cases. For example, if you demand formally verified code, you want to use the `fiat` backend (as it was generated from [Fiat Crypto][fiat]). If you want the highest performance possible, you probably want the `simd` backend.
+A _backend_ refers to an implementation of elliptic curve and scalar arithmetic. Different backends have different use cases. For example, if you demand formally verified code, you want to use the `fiat` backend (as it was generated from [Fiat Crypto][fiat]).
 
 Backend selection details and instructions can be found in the [curve25519-dalek docs](https://github.com/dalek-cryptography/curve25519-dalek#backends).
 
